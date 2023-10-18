@@ -1,10 +1,12 @@
 import os
+
+import aiohttp
 import openai
 import asyncio
 import _thread
 import random
 import logging
-import blivedm.blivedm as blivedm
+# import blivedm.blivedm as blivedm
 import configparser
 import uuid
 from queue import Queue, PriorityQueue
@@ -22,6 +24,16 @@ from xlutils.copy import copy
 from pypinyin import lazy_pinyin
 from flask import Flask, request,jsonify
 import tts
+
+import asyncio
+import aiohttp
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+DEVELOPER_KEY = 'AIzaSyCEjpidejwp2JdoiQsPrRg3Ucdb1-TpbY4'
+YOUTUBE_API_SERVICE_NAME = 'youtube'
+YOUTUBE_API_VERSION = 'v3'
+BASE_URL = "https://www.googleapis.com/youtube/v3"
 
 # 配置文件、当前文本、excel（对话列表数据库）、敏感词文本
 config_ini = 'config/config.ini'
@@ -151,6 +163,7 @@ def send2gpt(msg):
     if len(temp_message) > 3:
         del (temp_message[0])
     message = base_context + temp_message
+    print("message: ", message)
 
     # 子进程4
     # 开启 openai 进程
@@ -246,93 +259,6 @@ giftQue = PriorityQueue(maxsize=5)
 # 普通弹幕队列
 danmuQue = PriorityQueue(maxsize=10)
 topIDs = bili_config['topid'].split(',')
-async def run_single_client():
-    # 如果SSL验证失败就把ssl设为False，B站真的有过忘续证书的情况
-    client = blivedm.BLiveClient(roomID, ssl=True)
-    print(roomID)
-    handler = MyHandler()
-    client.add_handler(handler)
-    client.start()
-    try:
-        await client.join()
-    finally:
-        await client.stop_and_close()
-        
-class MyHandler(blivedm.BaseHandler):
-    async def _on_heartbeat(self, client: blivedm.BLiveClient, message: blivedm.HeartbeatMessage):
-        print(f'[{client.room_id}] 当前人气值：{message.popularity}')
-
-    async def _on_danmaku(self, client: blivedm.BLiveClient, message: blivedm.DanmakuMessage):
-        if message.dm_type == 0:
-            print(f'弹幕：[{client.room_id}] {message.uname}：{message.msg}')
-            # 权重计算
-            guardLevel = message.privilege_type
-            if guardLevel == 0:
-                guardLevel = 0
-            elif guardLevel == 3:
-                guardLevel = 200
-            elif guardLevel == 2:
-                guardLevel = 2000
-            elif guardLevel == 1:
-                guardLevel = 20000
-            # 舰长权重，勋章id权重*100，lv权重*100
-            medalevel = 0
-            if message.medal_room_id == roomID:
-                medalevel = message.medal_level * 100
-            rank = (999999 - message.user_level * 100 -
-                    guardLevel - medalevel - message.user_level * 10 + random.random())
-            if danmuQue.full():
-                try:
-                    danmuQue.get(True, 1)
-                except BaseException:
-                    print("on_danmuku时，get异常")
-            
-            queData = {'name': message.uname, 'type': 'danmu', 'num': 1, 'action': '说',
-                       'msg': message.msg.replace('[', '').replace(']', ''), 'price': 0}
-            if main_config['env'] == 'dev':
-                print("前弹幕队列容量：" + str(danmuQue.qsize()))
-                print("rank:" + str(rank) + ";name:" + message.uname + ";msg:" +
-                      message.msg.replace('[', '').replace(']', ''))
-                print(queData)
-            try:
-                danmuQue.put((rank, queData), True, 2)
-            except Exception as e:
-                print("ErrorStart-------------------------")
-                print(e)
-                print("put弹幕队列异常")
-                print(queData)
-                print("错误" + str(danmuQue.full()))
-                print("错误" + str(danmuQue.empty()))
-                print("后弹幕队列容量：" + str(danmuQue.qsize()))
-                print("ErrorEnd-------------------------")
-            
-    async def _on_gift(self, client: blivedm.BLiveClient, message: blivedm.GiftMessage):
-        if message.coin_type == 'gold':
-            print(f'礼物：：[{client.room_id}] {message.uname} 赠送{message.gift_name}x{message.num}'
-                  f' （{message.coin_type}瓜子x{message.total_coin}）')
-            price = message.total_coin / 1000
-            if giftQue.full():
-                giftQue.get(False, 1)
-            if price > 1:
-                queData = {"name": message.uname, "type": 'gift', 'num': message.num,
-                           'action': message.action, 'msg': message.gift_name, 'price': price}
-                giftQue.put(
-                    (999999 - price + random.random(), queData), True, 1)
-
-    async def _on_buy_guard(self, client: blivedm.BLiveClient, message: blivedm.GuardBuyMessage):
-        print(f'上舰：：[{client.room_id}] {message.username} 购买{message.gift_name}')
-        queData = {"name": message.username, "type": 'guard', 'num': 1,
-                   'action': '上', 'msg': '-1', 'price': message.price / 1000}
-        guardQue.put((message.guard_level + random.random(), queData))
-
-    async def _on_super_chat(self, client: blivedm.BLiveClient, message: blivedm.SuperChatMessage):
-        print(
-            f'SC：：[{client.room_id}] 醒目留言 ¥{message.price} {message.uname}：{message.message}')
-        # 名称、类型、数量、动作、消息、价格
-        queData = {"name": message.uname, "type": 'sc', 'num': 1,
-                   'action': '发送', 'msg': message.message, 'price': message.price}
-        scQue.put((999999 - message.price + random.random(), queData))
-
 
 # api
 log = logging.getLogger('werkzeug')
@@ -352,6 +278,35 @@ def subtitle():
     # 读取共享内存变量的值
     return curr_txt.value
 
+async def get_comments():
+    counter = 0
+    video_id = "63k5hT41O_0"
+    async with aiohttp.ClientSession() as session:
+        # Get liveChatId from the video
+        live_chat_url = f"{BASE_URL}/videos?part=liveStreamingDetails&id={video_id}&key={DEVELOPER_KEY}"
+        async with session.get(live_chat_url) as response:
+            data = await response.json()
+            live_chat_id = data['items'][0]['liveStreamingDetails']['activeLiveChatId']
+            print(f"Live Chat ID: {live_chat_id}")
+
+        next_page_token = None
+        while True:
+            live_chat_messages_url = f"{BASE_URL}/liveChat/messages?liveChatId={live_chat_id}&part=snippet&maxResults=200&key={DEVELOPER_KEY}"
+            if next_page_token:
+                live_chat_messages_url += f"&pageToken={next_page_token}"
+
+            async with session.get(live_chat_messages_url) as response:
+                data = await response.json()
+                for item in data['items']:
+                    queData = {'name': "liang xiang", 'type': 'danmu', 'num': 1, 'action': '说',
+                               'msg': item['snippet']['displayMessage'], 'price': 0}
+                    danmuQue.put((counter, queData), True, 2)
+                    counter += 1
+                    print(item['snippet']['displayMessage'])
+
+                next_page_token = data.get('nextPageToken')
+                polling_interval = data.get('pollingIntervalMillis', 5000) / 1000.0
+                await asyncio.sleep(polling_interval)  # wait as per the polling interval before next request
 
 
 if __name__ == '__main__':
@@ -363,8 +318,7 @@ if __name__ == '__main__':
     # 主进程
     # chatgpt
     _thread.start_new_thread(asyncio.run,(chatgpt(is_run),))
-    # bilibili
-    _thread.start_new_thread(asyncio.run,(run_single_client(),))
+    _thread.start_new_thread(asyncio.run, (get_comments(),))
     print('All thread start.')
 
        # 子进程1、2
